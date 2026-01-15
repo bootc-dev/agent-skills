@@ -1,0 +1,182 @@
+#!/usr/bin/env python3
+"""quiztool - Run and manage diff quizzes.
+
+Subcommands:
+    run       Run a quiz interactively from a JSON file
+    show      Display a quiz without running it
+
+Run 'quiztool <subcommand> --help' for details.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+
+def die(message: str) -> None:
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def read_answer() -> str:
+    """Read multi-line answer until empty line."""
+    lines = []
+    while True:
+        try:
+            line = input()
+        except EOFError:
+            break
+        if not line:
+            break
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    """Run a quiz interactively."""
+    quiz_file = Path(args.quiz_file)
+    if not quiz_file.exists():
+        die(f"Quiz file not found: {quiz_file}")
+
+    with quiz_file.open() as f:
+        quiz = json.load(f)
+
+    title = quiz.get("title", "Diff Quiz")
+    difficulty = quiz.get("difficulty", "unknown")
+    commit = quiz.get("commit", "unknown")
+    questions = quiz.get("questions", [])
+
+    if not questions:
+        die("No questions in quiz file")
+
+    # Generate answers filename
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    answers_file = Path(f".answers-{timestamp}.json")
+
+    print("=" * 60)
+    print(f"  {title}")
+    print("=" * 60)
+    print(f"  Difficulty: {difficulty}")
+    print(f"  Commit: {commit}")
+    print(f"  Questions: {len(questions)}")
+    print()
+    print(f"  Answers will be saved to: {answers_file}")
+    print()
+    print("  For multi-line answers, press Enter twice to submit.")
+    print("=" * 60)
+    print()
+
+    answers = {
+        "quiz_file": str(quiz_file),
+        "title": title,
+        "difficulty": difficulty,
+        "commit": commit,
+        "started": datetime.now().isoformat(),
+        "answers": [],
+    }
+
+    for i, q in enumerate(questions, 1):
+        print("-" * 60)
+        print(f"Question {i} of {len(questions)}")
+        print("-" * 60)
+        print()
+        print(q.get("text", ""))
+        print()
+        if q.get("expected_type"):
+            print(f"Expected answer type: {q['expected_type']}")
+        print()
+        print("Your answer (empty line to submit):")
+
+        answer = read_answer()
+        answers["answers"].append({
+            "question": q.get("text", ""),
+            "answer": answer,
+        })
+        print()
+
+        # Prompt to continue every 3 questions
+        if i < len(questions) and i % 3 == 0:
+            try:
+                cont = input("Continue to more questions? [Y/n] ").strip().lower()
+            except EOFError:
+                cont = "n"
+            if cont == "n":
+                print("Stopping early. Your answers so far have been saved.")
+                break
+            print()
+
+    answers["finished"] = datetime.now().isoformat()
+
+    with answers_file.open("w") as f:
+        json.dump(answers, f, indent=2)
+        f.write("\n")
+
+    print("=" * 60)
+    print(f"Quiz complete! Answers saved to: {answers_file}")
+    print("=" * 60)
+
+
+def cmd_show(args: argparse.Namespace) -> None:
+    """Display a quiz without running it."""
+    quiz_file = Path(args.quiz_file)
+    if not quiz_file.exists():
+        die(f"Quiz file not found: {quiz_file}")
+
+    with quiz_file.open() as f:
+        quiz = json.load(f)
+
+    title = quiz.get("title", "Diff Quiz")
+    difficulty = quiz.get("difficulty", "unknown")
+    commit = quiz.get("commit", "unknown")
+    questions = quiz.get("questions", [])
+
+    print(f"# {title}")
+    print()
+    print(f"**Difficulty:** {difficulty}")
+    print(f"**Commit:** {commit}")
+    print()
+    print("---")
+    print()
+    print("## Questions")
+    print()
+
+    for i, q in enumerate(questions, 1):
+        print(f"### Question {i}")
+        print(q.get("text", ""))
+        print()
+        if q.get("expected_type"):
+            print(f"**Expected answer type:** {q['expected_type']}")
+            print()
+
+
+def main(argv: Sequence[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        prog="quiztool",
+        description="Run and manage diff quizzes.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # run
+    p = subparsers.add_parser("run", help="Run a quiz interactively")
+    p.add_argument("quiz_file", help="Path to quiz JSON file")
+    p.set_defaults(func=cmd_run)
+
+    # show
+    p = subparsers.add_parser("show", help="Display quiz without running")
+    p.add_argument("quiz_file", help="Path to quiz JSON file")
+    p.set_defaults(func=cmd_show)
+
+    args = parser.parse_args(argv)
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
