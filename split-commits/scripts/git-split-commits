@@ -1,0 +1,474 @@
+#!/usr/bin/env python3
+"""
+git-split-commits: Non-interactive tool for splitting changes into multiple commits.
+Designed for AI agents that don't have TTY access for `git add -i`.
+
+Usage:
+  git-split-commits prepare TOPIC1 [TOPIC2 ...]   Initialize session with topics
+  git-split-commits status                         Show session status as JSON
+  git-split-commits next [HUNK_ID]                 Show a hunk (default: next unassigned)
+  git-split-commits assign HUNK_ID TOPIC           Assign a hunk to a topic
+  git-split-commits stage TOPIC                    Stage all hunks for a topic  
+  git-split-commits commit TOPIC "message"         Stage and commit a topic
+  git-split-commits reset                          Clear the session
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Optional
+
+
+def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a git command."""
+    result = subprocess.run(
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr}")
+    return result
+
+
+def get_git_dir() -> Path:
+    """Get the .git directory path."""
+    result = git("rev-parse", "--git-dir")
+    return Path(result.stdout.strip())
+
+
+def hash_object(filepath: str) -> str:
+    """Get the blob hash of a file's current content."""
+    result = git("hash-object", filepath)
+    return result.stdout.strip()
+
+
+def get_index_blob(filepath: str) -> Optional[str]:
+    """Get the blob hash of a file in the index."""
+    result = git("ls-files", "-s", filepath, check=False)
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    parts = result.stdout.strip().split()
+    return parts[1] if len(parts) >= 2 else None
+
+
+def die(msg: str) -> None:
+    """Print error and exit."""
+    print(json.dumps({"error": msg}), file=sys.stderr)
+    sys.exit(1)
+
+
+class SplitSession:
+    """Manages a commit splitting session."""
+
+    def __init__(self):
+        self.git_dir = get_git_dir()
+        self.state_dir = self.git_dir / "split-commits"
+        self.state_file = self.state_dir / "state.json"
+        self.hunks_dir = self.state_dir / "hunks"
+
+    def exists(self) -> bool:
+        return self.state_file.exists()
+
+    def load(self) -> dict:
+        if not self.exists():
+            die("no active session - run 'git-split-commits prepare' first")
+        return json.loads(self.state_file.read_text())
+
+    def save(self, state: dict) -> None:
+        self.state_file.write_text(json.dumps(state, indent=2))
+
+    def reset(self) -> None:
+        if self.state_dir.exists():
+            shutil.rmtree(self.state_dir)
+            print(json.dumps({"status": "session_cleared"}))
+        else:
+            print(json.dumps({"status": "no_session"}))
+
+    def prepare(self, topics: list[str]) -> None:
+        """Initialize a new splitting session."""
+        if not topics:
+            die("usage: git-split-commits prepare TOPIC1 [TOPIC2 ...]")
+
+        # Check for changes
+        diff_result = git("diff", "--quiet", check=False)
+        cached_result = git("diff", "--cached", "--quiet", check=False)
+        if diff_result.returncode == 0 and cached_result.returncode == 0:
+            die("no changes to split")
+
+        # Unstage any staged changes
+        if cached_result.returncode != 0:
+            git("reset", "HEAD", check=False)
+
+        # Create fresh state directory
+        if self.state_dir.exists():
+            shutil.rmtree(self.state_dir)
+        self.state_dir.mkdir(parents=True)
+        self.hunks_dir.mkdir()
+
+        # Get changed files and their blob hashes for validation
+        changed_files = git("diff", "--name-only").stdout.strip().split("\n")
+        file_blobs = {}
+        for filepath in changed_files:
+            if filepath:
+                file_blobs[filepath] = {
+                    "index": get_index_blob(filepath),
+                    "worktree": hash_object(filepath),
+                }
+
+        # Parse diff into hunks
+        hunks = []
+        for filepath in changed_files:
+            if not filepath:
+                continue
+            file_diff = git("diff", "--full-index", "--", filepath).stdout
+            hunks.extend(self._parse_file_hunks(filepath, file_diff))
+
+        # Save state
+        state = {
+            "topics": topics,
+            "hunks": hunks,
+            "file_blobs": file_blobs,
+            "head": git("rev-parse", "HEAD").stdout.strip(),
+        }
+        self.save(state)
+
+        # Output summary as JSON
+        result = {
+            "status": "prepared",
+            "topics": topics,
+            "total_hunks": len(hunks),
+            "files": list(file_blobs.keys()),
+        }
+        print(json.dumps(result, indent=2))
+
+    def _parse_file_hunks(self, filepath: str, diff: str) -> list[dict]:
+        """Parse a file's diff into individual hunks."""
+        hunks = []
+        lines = diff.split("\n")
+
+        # Find header (everything before first @@)
+        header_lines = []
+        hunk_start_indices = []
+        for i, line in enumerate(lines):
+            if line.startswith("@@"):
+                hunk_start_indices.append(i)
+            elif not hunk_start_indices:
+                header_lines.append(line)
+
+        if not hunk_start_indices:
+            return hunks
+
+        header = "\n".join(header_lines)
+        total_hunks = len(hunk_start_indices)
+
+        # Extract each hunk
+        for idx, start in enumerate(hunk_start_indices):
+            end = hunk_start_indices[idx + 1] if idx + 1 < len(hunk_start_indices) else len(lines)
+            hunk_lines = lines[start:end]
+            
+            # Parse the @@ line to get line numbers
+            hunk_header = hunk_lines[0] if hunk_lines else ""
+            old_start = new_start = 0
+            if hunk_header.startswith("@@"):
+                # Format: @@ -old_start,old_count +new_start,new_count @@
+                import re
+                match = re.match(r"@@ -(\d+)", hunk_header)
+                if match:
+                    old_start = int(match.group(1))
+                match = re.match(r"@@ -\d+(?:,\d+)? \+(\d+)", hunk_header)
+                if match:
+                    new_start = int(match.group(1))
+
+            # Extract fingerprint: first context line and first changed line
+            # Context lines start with ' ', removed with '-', added with '+'
+            first_context = None
+            first_change = None
+            for hl in hunk_lines[1:]:  # Skip @@ header
+                if hl.startswith(" ") and first_context is None:
+                    first_context = hl[1:]  # Strip the leading space
+                elif hl.startswith(("+", "-")) and first_change is None:
+                    first_change = hl  # Keep the +/- prefix
+                if first_context and first_change:
+                    break
+
+            hunk_id = len(list(self.hunks_dir.glob("*.patch")))
+            patch_file = self.hunks_dir / f"hunk_{hunk_id}.patch"
+            patch_content = header + "\n" + "\n".join(hunk_lines) + "\n"
+            patch_file.write_text(patch_content)
+
+            hunks.append({
+                "id": hunk_id,
+                "file": filepath,
+                "hunk": idx + 1,
+                "of": total_hunks,
+                "old_start": old_start,
+                "new_start": new_start,
+                "first_context": first_context,
+                "first_change": first_change,
+                "topic": None,
+            })
+
+        return hunks
+
+    def status(self) -> None:
+        """Show status as JSON with topic counts."""
+        state = self.load()
+        
+        # Count hunks per topic
+        topic_counts = {t: 0 for t in state["topics"]}
+        topic_counts["unassigned"] = 0
+        
+        for h in state["hunks"]:
+            topic = h["topic"] or "unassigned"
+            if topic in topic_counts:
+                topic_counts[topic] += 1
+            else:
+                topic_counts[topic] = 1
+
+        result = {
+            "topics": state["topics"],
+            "topic_counts": topic_counts,
+            "total_hunks": len(state["hunks"]),
+            "assigned": sum(1 for h in state["hunks"] if h["topic"]),
+            "hunks": [
+                {
+                    "id": h["id"],
+                    "file": h["file"],
+                    "hunk": h["hunk"],
+                    "of": h["of"],
+                    "old_start": h.get("old_start", 0),
+                    "new_start": h.get("new_start", 0),
+                    "first_context": h.get("first_context"),
+                    "first_change": h.get("first_change"),
+                    "topic": h["topic"],
+                }
+                for h in state["hunks"]
+            ],
+        }
+        print(json.dumps(result, indent=2))
+
+    def next(self, hunk_id: Optional[int] = None) -> None:
+        """Show a specific hunk or next unassigned."""
+        state = self.load()
+
+        if hunk_id is None:
+            # Find first unassigned
+            unassigned = [h for h in state["hunks"] if h["topic"] is None]
+            if not unassigned:
+                print(json.dumps({"status": "all_assigned", "total": len(state["hunks"])}))
+                return
+            hunk_id = unassigned[0]["id"]
+
+        hunk = next((h for h in state["hunks"] if h["id"] == hunk_id), None)
+        if not hunk:
+            die(f"hunk {hunk_id} not found")
+
+        patch_file = self.hunks_dir / f"hunk_{hunk_id}.patch"
+        patch_content = patch_file.read_text()
+
+        result = {
+            "id": hunk_id,
+            "file": hunk["file"],
+            "hunk": hunk["hunk"],
+            "of": hunk["of"],
+            "old_start": hunk.get("old_start", 0),
+            "new_start": hunk.get("new_start", 0),
+            "topic": hunk["topic"],
+            "topics_available": state["topics"],
+            "patch": patch_content,
+        }
+        print(json.dumps(result, indent=2))
+
+    def assign(self, hunk_id: int, topic: str) -> None:
+        """Assign a hunk to a topic."""
+        state = self.load()
+
+        if topic not in state["topics"]:
+            die(f"unknown topic '{topic}'. Available: {', '.join(state['topics'])}")
+
+        hunk = next((h for h in state["hunks"] if h["id"] == hunk_id), None)
+        if not hunk:
+            die(f"hunk {hunk_id} not found")
+
+        old_topic = hunk["topic"]
+        hunk["topic"] = topic
+        self.save(state)
+        
+        result = {
+            "status": "assigned",
+            "hunk_id": hunk_id,
+            "file": hunk["file"],
+            "old_topic": old_topic,
+            "new_topic": topic,
+        }
+        print(json.dumps(result, indent=2))
+
+    def _validate_not_stale(self, state: dict, topic_hunks: list[dict]) -> None:
+        """Check that files haven't been modified since prepare.
+        
+        Uses two validation strategies:
+        1. Blob hash comparison for overall file integrity
+        2. Line content fingerprint check for hunk-level validation
+        """
+        stale_files = []
+        stale_hunks = []
+        
+        # Check blob hashes for files we're about to commit
+        files_to_check = set(h["file"] for h in topic_hunks)
+        for filepath in files_to_check:
+            blobs = state.get("file_blobs", {}).get(filepath, {})
+            if not Path(filepath).exists():
+                stale_files.append({"file": filepath, "reason": "deleted"})
+                continue
+            current_worktree = hash_object(filepath)
+            if current_worktree != blobs.get("worktree"):
+                stale_files.append({"file": filepath, "reason": "modified"})
+        
+        if stale_files:
+            die(f"working tree modified since prepare - run 'git-split-commits reset' and 'prepare' again. Stale: {stale_files}")
+        
+        # Fingerprint validation is informational only - the blob hash check above
+        # is the authoritative staleness detection. The fingerprints are useful for
+        # identifying hunks in the JSON output, but line numbers shift within a
+        # modified file, making position-based validation unreliable.
+        # 
+        # If you want stricter validation, uncomment the check below, but note
+        # that it may produce false positives when hunks modify nearby lines.
+        #
+        # for hunk in topic_hunks:
+        #     filepath = hunk["file"]
+        #     first_context = hunk.get("first_context")
+        #     if first_context:
+        #         with open(filepath) as f:
+        #             if first_context not in f.read():
+        #                 stale_hunks.append({"hunk_id": hunk["id"], ...})
+
+    def stage(self, topic: str) -> None:
+        """Stage all hunks for a topic."""
+        state = self.load()
+
+        if topic not in state["topics"]:
+            die(f"unknown topic '{topic}'")
+
+        topic_hunks = [h for h in state["hunks"] if h["topic"] == topic]
+        if not topic_hunks:
+            die(f"no hunks assigned to topic '{topic}'")
+
+        # Validate working tree hasn't changed
+        self._validate_not_stale(state, topic_hunks)
+
+        # Unstage everything
+        git("reset", "HEAD", check=False)
+
+        # Apply each patch
+        applied = []
+        for hunk in topic_hunks:
+            patch_file = self.hunks_dir / f"hunk_{hunk['id']}.patch"
+            result = git("apply", "--cached", str(patch_file), check=False)
+            if result.returncode != 0:
+                # Try with --3way for context conflicts
+                result = git("apply", "--cached", "--3way", str(patch_file), check=False)
+                if result.returncode != 0:
+                    die(f"failed to apply hunk {hunk['id']}: {result.stderr}")
+            applied.append(hunk["id"])
+
+        # Get staged diff stat
+        stat = git("diff", "--cached", "--stat").stdout
+
+        result = {
+            "status": "staged",
+            "topic": topic,
+            "hunks_staged": applied,
+            "stat": stat,
+        }
+        print(json.dumps(result, indent=2))
+
+    def commit(self, topic: str, message: str) -> None:
+        """Stage and commit a topic."""
+        state = self.load()
+        
+        # Stage first (this validates and applies patches)
+        self.stage(topic)
+
+        # Commit
+        git("commit", "-m", message)
+        commit_hash = git("rev-parse", "--short", "HEAD").stdout.strip()
+
+        # Remove committed hunks from state and update file blobs
+        remaining_hunks = [h for h in state["hunks"] if h["topic"] != topic]
+        
+        # Update blob hashes for affected files (HEAD has moved)
+        committed_files = set(h["file"] for h in state["hunks"] if h["topic"] == topic)
+        for filepath in committed_files:
+            if filepath in state["file_blobs"]:
+                # Update index blob to new HEAD
+                state["file_blobs"][filepath]["index"] = get_index_blob(filepath)
+        
+        state["hunks"] = remaining_hunks
+        state["head"] = git("rev-parse", "HEAD").stdout.strip()
+        self.save(state)
+
+        result = {
+            "status": "committed",
+            "topic": topic,
+            "commit": commit_hash,
+            "message": message,
+            "remaining_hunks": len(remaining_hunks),
+        }
+        print(json.dumps(result, indent=2))
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help", "help"):
+        print(__doc__)
+        print("""
+Example workflow:
+  $ git-split-commits prepare "refactor" "feature" "bugfix"
+  $ git-split-commits status
+  $ git-split-commits next           # View next unassigned hunk
+  $ git-split-commits assign 0 refactor
+  $ git-split-commits assign 1 feature  
+  $ git-split-commits commit refactor "refactor: Clean up code"
+  $ git-split-commits commit feature "feat: Add new feature"
+""")
+        sys.exit(0)
+
+    try:
+        session = SplitSession()
+        cmd = sys.argv[1]
+
+        if cmd == "prepare":
+            session.prepare(sys.argv[2:])
+        elif cmd == "status":
+            session.status()
+        elif cmd == "next":
+            hunk_id = int(sys.argv[2]) if len(sys.argv) > 2 else None
+            session.next(hunk_id)
+        elif cmd == "assign":
+            if len(sys.argv) < 4:
+                die("usage: git-split-commits assign HUNK_ID TOPIC")
+            session.assign(int(sys.argv[2]), sys.argv[3])
+        elif cmd == "stage":
+            if len(sys.argv) < 3:
+                die("usage: git-split-commits stage TOPIC")
+            session.stage(sys.argv[2])
+        elif cmd == "commit":
+            if len(sys.argv) < 4:
+                die("usage: git-split-commits commit TOPIC \"message\"")
+            session.commit(sys.argv[2], " ".join(sys.argv[3:]))
+        elif cmd == "reset":
+            session.reset()
+        else:
+            die(f"unknown command: {cmd}. Use --help for usage.")
+
+    except RuntimeError as e:
+        die(str(e))
+
+
+if __name__ == "__main__":
+    main()
