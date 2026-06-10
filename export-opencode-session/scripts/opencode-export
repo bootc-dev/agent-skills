@@ -1,0 +1,644 @@
+#!/usr/bin/env python3
+"""opencode-export — Export an opencode session to Markdown.
+
+Subcommands:
+    list     List recent sessions
+    export   Export a session to Markdown (stdout or file)
+    publish  Publish a session: create a Gist, post a new comment, or
+             append a collapsible transcript to an existing issue/PR comment
+
+Run 'opencode-export <subcommand> --help' for details.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import textwrap
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Database location
+# ---------------------------------------------------------------------------
+
+def default_db_path() -> Path:
+    xdg_data = os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
+    return Path(xdg_data) / "opencode" / "opencode.db"
+
+
+def open_db(path: Path) -> sqlite3.Connection:
+    if not path.exists():
+        die(f"opencode database not found: {path}\n"
+            "Make sure opencode has been run at least once, or pass --db <path>.")
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def die(message: str) -> None:
+    print(f"error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def require_gh() -> str:
+    gh = shutil.which("gh")
+    if not gh:
+        die("gh (GitHub CLI) is required for publish but was not found in PATH.\n"
+            "Install from https://cli.github.com/ and run 'gh auth login'.")
+    return gh
+
+
+def fmt_timestamp(ms: int | None) -> str:
+    if not ms:
+        return "unknown"
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def fmt_cost(cost: float) -> str:
+    if cost < 0.0001:
+        return "<$0.0001"
+    return f"${cost:.4f}"
+
+
+def fmt_tokens(n: int) -> str:
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}k"
+    return str(n)
+
+
+def truncate(text: str, max_chars: int = 800) -> str:
+    if len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    return text[:max_chars] + f"\n… ({omitted} chars omitted)"
+
+
+def escape_html_tags(text: str) -> str:
+    """Escape < so HTML tags in tool output don't confuse GitHub's HTML parser
+    when the text is embedded inside a <details> block. GitHub scans for HTML
+    tags in the raw source before rendering Markdown, so even content inside
+    fenced code blocks can prematurely close a <details> element.
+    Replacing < with &lt; is safe because GitHub renders &lt; as < inside <pre>."""
+    return text.replace("<", "&lt;")
+
+
+# ---------------------------------------------------------------------------
+# Database queries
+# ---------------------------------------------------------------------------
+
+def list_sessions(conn: sqlite3.Connection, limit: int = 20) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, title, version, cost, tokens_input, tokens_output,
+               time_created, time_updated
+        FROM session
+        WHERE parent_id IS NULL
+        ORDER BY time_created DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def get_session(conn: sqlite3.Connection, session_id: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM session WHERE id = ?", (session_id,)
+    ).fetchone()
+
+
+def get_messages(conn: sqlite3.Connection, session_id: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, time_created, data
+        FROM message
+        WHERE session_id = ?
+        ORDER BY time_created, id
+        """,
+        (session_id,),
+    ).fetchall()
+
+
+def get_parts(conn: sqlite3.Connection, session_id: str) -> dict[str, list[dict]]:
+    """Return parts grouped by message_id, each parsed from JSON."""
+    rows = conn.execute(
+        """
+        SELECT id, message_id, data
+        FROM part
+        WHERE session_id = ?
+        ORDER BY id
+        """,
+        (session_id,),
+    ).fetchall()
+
+    result: dict[str, list[dict]] = {}
+    for row in rows:
+        mid = row["message_id"]
+        data = json.loads(row["data"]) if isinstance(row["data"], str) else row["data"]
+        data["id"] = row["id"]
+        result.setdefault(mid, []).append(data)
+    return result
+
+
+def resolve_session(conn: sqlite3.Connection, session_id: str | None,
+                    latest: bool) -> sqlite3.Row:
+    if latest:
+        rows = list_sessions(conn, limit=1)
+        if not rows:
+            die("No sessions found in the database.")
+        row = get_session(conn, rows[0]["id"])
+        assert row is not None
+        return row
+
+    if not session_id:
+        die("Provide a session ID or --latest.")
+
+    row = get_session(conn, session_id)
+    if row is not None:
+        return row
+
+    # Try suffix match against recent sessions
+    all_sessions = list_sessions(conn, limit=500)
+    matches = [s for s in all_sessions if s["id"].endswith(session_id)]
+    if len(matches) == 1:
+        row = get_session(conn, matches[0]["id"])
+        assert row is not None
+        return row
+    if len(matches) > 1:
+        die(f"Ambiguous session ID suffix '{session_id}': matches {len(matches)} sessions. "
+            "Provide more characters.")
+    die(f"Session not found: {session_id}")
+
+
+# ---------------------------------------------------------------------------
+# Markdown rendering
+# ---------------------------------------------------------------------------
+
+TOOL_ICON: dict[str, str] = {
+    "read": "📄",
+    "edit": "✏️",
+    "write": "📝",
+    "bash": "💻",
+    "glob": "🔍",
+    "grep": "🔎",
+    "list": "📂",
+    "webfetch": "🌐",
+    "task": "🤖",
+}
+
+
+def tool_icon(name: str) -> str:
+    for prefix, icon in TOOL_ICON.items():
+        if name.lower().startswith(prefix):
+            return icon
+    return "🔧"
+
+
+def render_tool_part(part: dict) -> str:
+    tool = part.get("tool", "unknown")
+    state = part.get("state", {})
+    status = state.get("status", "?")
+    title = state.get("title") or tool
+    icon = tool_icon(tool)
+
+    lines: list[str] = []
+
+    if status == "completed":
+        duration_ms = state.get("time", {}).get("end", 0) - state.get("time", {}).get("start", 0)
+        duration = f"{duration_ms / 1000:.1f}s" if duration_ms > 0 else ""
+        summary_line = f"{icon} **{title}**"
+        if duration:
+            summary_line += f" _{duration}_"
+        lines.append(f"<details><summary>{summary_line}</summary>\n")
+
+        inp = state.get("input", {})
+        if inp:
+            inp_json = escape_html_tags(json.dumps(inp, indent=2))
+            if len(inp_json) > 1200:
+                inp_json = inp_json[:1200] + "\n… (truncated)"
+            lines.append(f"**Input:**\n```json\n{inp_json}\n```\n")
+
+        output = state.get("output", "")
+        if output:
+            lines.append(f"**Output:**\n```\n{escape_html_tags(truncate(output, 600))}\n```\n")
+
+        lines.append("</details>")
+    elif status == "error":
+        err = state.get("error", "")
+        lines.append(f"<details><summary>{icon} **{title}** ❌</summary>\n")
+        if err:
+            lines.append(f"**Error:**\n```\n{escape_html_tags(truncate(err, 400))}\n```\n")
+        lines.append("</details>")
+    else:
+        # pending/running — shouldn't appear in a finished session but be safe
+        lines.append(f"{icon} `{tool}` _{status}_")
+
+    return "\n".join(lines)
+
+
+def render_reasoning_part(part: dict) -> str:
+    text = part.get("text", "").strip()
+    if not text:
+        return ""
+    return f"<details><summary>🧠 Thinking</summary>\n\n{truncate(text, 1200)}\n\n</details>"
+
+
+def render_text_part(part: dict) -> str:
+    text = part.get("text", "").strip()
+    if not text:
+        return ""
+    # synthetic parts (e.g. file context injections) are noise — skip
+    if part.get("synthetic"):
+        return ""
+    # Escape <details and </details> in prose so they don't confuse GitHub's
+    # HTML parser when the text appears inside a <details> block or near one.
+    text = re.sub(r'<(/?)details', lambda m: f"&lt;{m.group(1)}details", text)
+    return text
+
+
+def render_file_part(part: dict) -> str:
+    filename = part.get("filename") or part.get("url", "attachment")
+    mime = part.get("mime", "")
+    return f"📎 `{filename}` _{mime}_"
+
+
+def render_subtask_part(part: dict) -> str:
+    desc = part.get("description", "")
+    agent = part.get("agent", "")
+    return f"<details><summary>🤖 Subagent: {desc or agent}</summary>\n\n_Agent: {agent}_\n\n</details>"
+
+
+def render_part(part: dict) -> str:
+    t = part.get("type", "")
+    if t == "text":
+        return render_text_part(part)
+    if t == "reasoning":
+        return render_reasoning_part(part)
+    if t == "tool":
+        return render_tool_part(part)
+    if t == "file":
+        return render_file_part(part)
+    if t == "subtask":
+        return render_subtask_part(part)
+    # step-start, step-finish, snapshot, patch, compaction, retry, agent — skip
+    return ""
+
+
+def render_message(msg_data: dict, parts: list[dict], role: str) -> str:
+    chunks: list[str] = []
+
+    error = msg_data.get("error") if role == "assistant" else None
+    if error:
+        err_name = error.get("name", "")
+        err_msg = error.get("message", "")
+        warning = f"> ⚠️ **{err_name}**: {err_msg}" if err_name else f"> ⚠️ {err_msg}"
+        chunks.append(warning)
+
+    for part in parts:
+        rendered = render_part(part)
+        if rendered:
+            chunks.append(rendered)
+
+    return "\n\n".join(chunks)
+
+
+def build_markdown(session: sqlite3.Row, messages: list[sqlite3.Row],
+                   parts_by_msg: dict[str, list[dict]]) -> str:
+    title = session["title"] or "Untitled session"
+    version = session["version"] or ""
+    cost = session["cost"] or 0.0
+    tokens_in = session["tokens_input"] or 0
+    tokens_out = session["tokens_output"] or 0
+    tokens_reasoning = session["tokens_reasoning"] or 0
+    created = session["time_created"]
+
+    # Collect models used
+    models: list[str] = []
+    seen_models: set[str] = set()
+    for msg_row in messages:
+        data = json.loads(msg_row["data"]) if isinstance(msg_row["data"], str) else msg_row["data"]
+        if data.get("role") == "assistant":
+            pid = data.get("providerID", "")
+            mid = data.get("modelID", "")
+            key = f"{pid}/{mid}" if pid else mid
+            if key and key not in seen_models:
+                seen_models.add(key)
+                models.append(key)
+
+    out: list[str] = []
+
+    # Header
+    out.append(f"# {title}\n")
+    meta_parts = []
+    if created:
+        meta_parts.append(fmt_timestamp(created))
+    if version:
+        meta_parts.append(f"opencode v{version}")
+    if models:
+        meta_parts.append(", ".join(models))
+    if meta_parts:
+        out.append(" · ".join(meta_parts) + "\n")
+
+    # Stats
+    stats: list[str] = []
+    if cost:
+        stats.append(f"**Cost:** {fmt_cost(cost)}")
+    if tokens_in or tokens_out:
+        stats.append(f"**Tokens:** {fmt_tokens(tokens_in)} in / {fmt_tokens(tokens_out)} out"
+                     + (f" / {fmt_tokens(tokens_reasoning)} reasoning" if tokens_reasoning else ""))
+    if stats:
+        out.append("  ".join(stats) + "\n")
+
+    # Messages — group into (user, [assistant...]) turns so each turn gets one
+    # separator and one role header, regardless of how many step-messages the
+    # assistant emitted.
+    Turn = list  # list of (data, parts, role)
+    turns: list[tuple[str, list]] = []  # (role, rendered_chunks)
+
+    def flush_turn(role: str, rendered_chunks: list[str]) -> None:
+        body = "\n\n".join(c for c in rendered_chunks if c)
+        if not body:
+            return
+        out.append("---")
+        if role == "user":
+            out.append(f"**User:**\n\n{body}")
+        else:
+            out.append(f"**Assistant:**\n\n{body}")
+
+    cur_role: str | None = None
+    cur_chunks: list[str] = []
+
+    for msg_row in messages:
+        data = json.loads(msg_row["data"]) if isinstance(msg_row["data"], str) else msg_row["data"]
+        role = data.get("role", "user")
+        msg_id = msg_row["id"]
+        parts = parts_by_msg.get(msg_id, [])
+        rendered = render_message(data, parts, role)
+
+        if role != cur_role:
+            if cur_role is not None:
+                flush_turn(cur_role, cur_chunks)
+            cur_role = role
+            cur_chunks = [rendered] if rendered else []
+        else:
+            if rendered:
+                cur_chunks.append(rendered)
+
+    if cur_role is not None:
+        flush_turn(cur_role, cur_chunks)
+
+    out.append("\n---\n\n_Exported with `opencode-export` from the "
+               "[export-opencode-session](https://github.com/bootc-dev/agent-skills) skill._\n")
+
+    return "\n\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Publish helpers
+# ---------------------------------------------------------------------------
+
+def gh_run(gh: str, args: list[str], input_text: str | None = None) -> str:
+    """Run a gh command and return stdout. Exits on failure."""
+    result = subprocess.run(
+        [gh] + args,
+        input=input_text,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(result.stderr.strip(), file=sys.stderr)
+        die(f"gh exited with code {result.returncode}")
+    return result.stdout.strip()
+
+
+def publish_gist(gh: str, markdown: str, title: str, public: bool) -> None:
+    # Sanitise title into a filename
+    safe = "".join(c if c.isalnum() or c in " -_" else "-" for c in title).strip()[:60]
+    filename = f"{safe or 'opencode-session'}.md"
+
+    args = ["gist", "create", "--filename", filename]
+    if public:
+        args.append("--public")
+    args.append("-")
+
+    url = gh_run(gh, args, input_text=markdown)
+    print(url)
+
+
+def get_comment_body(gh: str, repo: str, comment_id: str) -> str:
+    """Fetch the current body of a GitHub issue/PR comment by its numeric ID."""
+    endpoint = f"repos/{repo}/issues/comments/{comment_id}"
+    raw = gh_run(gh, ["api", endpoint])
+    return json.loads(raw).get("body", "")
+
+
+def patch_comment_body(gh: str, repo: str, comment_id: str, new_body: str) -> None:
+    endpoint = f"repos/{repo}/issues/comments/{comment_id}"
+    gh_run(gh, ["api", "--method", "PATCH", endpoint, "-f", f"body={new_body}"])
+
+
+def publish_new_comment(gh: str, issue_ref: str, body: str) -> None:
+    """Post body as a new comment on an issue or PR."""
+    # issue_ref is "<owner>/<repo>#<number>" or just a URL
+    if issue_ref.startswith("https://"):
+        gh_run(gh, ["issue", "comment", issue_ref, "--body", body])
+    else:
+        # split "owner/repo#42" → repo arg + number
+        if "#" not in issue_ref:
+            die(f"Expected issue reference like owner/repo#42 or a URL, got: {issue_ref}")
+        repo_part, number = issue_ref.rsplit("#", 1)
+        gh_run(gh, ["issue", "comment", number, "--repo", repo_part, "--body", body])
+    print("Comment posted.", file=sys.stderr)
+
+
+def publish_edit_comment(gh: str, repo: str, comment_id: str,
+                         markdown: str, summary: str) -> None:
+    """Append a <details> block containing the session transcript to an existing comment."""
+    existing = get_comment_body(gh, repo, comment_id)
+
+    details_block = (
+        f"\n\n<details>\n<summary>opencode session: {summary}</summary>\n\n"
+        f"{markdown}\n\n</details>"
+    )
+    new_body = existing + details_block
+
+    patch_comment_body(gh, repo, comment_id, new_body)
+
+    # Print the comment URL for easy reference
+    endpoint = f"repos/{repo}/issues/comments/{comment_id}"
+    raw = gh_run(gh, ["api", endpoint])
+    url = json.loads(raw).get("html_url", "")
+    print(url or "Comment updated.", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_list(args: argparse.Namespace) -> None:
+    db_path = Path(args.db) if args.db else default_db_path()
+    conn = open_db(db_path)
+
+    sessions = list_sessions(conn, limit=args.limit)
+    if not sessions:
+        print("No sessions found.")
+        return
+
+    print(f"{'ID':>12}  {'Created':<20}  {'Cost':>8}  Title")
+    print("-" * 80)
+    for s in sessions:
+        short_id = s["id"][-12:]
+        created = fmt_timestamp(s["time_created"])
+        cost = fmt_cost(s["cost"] or 0)
+        title = (s["title"] or "")[:50]
+        print(f"{short_id}  {created:<20}  {cost:>8}  {title}")
+
+    print(f"\nShowing {len(sessions)} most recent sessions.")
+    print("Use the full ID (or enough trailing chars to be unique) with: opencode-export export <id>")
+
+
+def cmd_export(args: argparse.Namespace) -> None:
+    db_path = Path(args.db) if args.db else default_db_path()
+    conn = open_db(db_path)
+
+    session = resolve_session(conn, args.session_id, args.latest)
+    messages = get_messages(conn, session["id"])
+    parts_by_msg = get_parts(conn, session["id"])
+    markdown = build_markdown(session, messages, parts_by_msg)
+
+    if args.output:
+        out_path = Path(args.output)
+        out_path.write_text(markdown, encoding="utf-8")
+        print(f"Written to {out_path}", file=sys.stderr)
+    else:
+        sys.stdout.write(markdown)
+
+
+def cmd_publish(args: argparse.Namespace) -> None:
+    db_path = Path(args.db) if args.db else default_db_path()
+    conn = open_db(db_path)
+    gh = require_gh()
+
+    session = resolve_session(conn, args.session_id, args.latest)
+    messages = get_messages(conn, session["id"])
+    parts_by_msg = get_parts(conn, session["id"])
+    markdown = build_markdown(session, messages, parts_by_msg)
+
+    title = session["title"] or "opencode session"
+
+    if args.gist:
+        publish_gist(gh, markdown, title, public=args.public)
+
+    elif args.new_comment:
+        publish_new_comment(gh, args.new_comment, markdown)
+
+    elif args.edit_comment:
+        if not args.repo:
+            # Try to infer repo from the current directory
+            try:
+                raw = subprocess.check_output(
+                    [gh, "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
+                    text=True,
+                ).strip()
+                args.repo = raw
+            except subprocess.CalledProcessError:
+                die("Could not detect current repo. Pass --repo owner/repo explicitly.")
+        publish_edit_comment(gh, args.repo, args.edit_comment, markdown,
+                             summary=args.summary or title)
+    else:
+        die("Specify a publish target: --gist, --new-comment, or --edit-comment")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def add_session_args(p: argparse.ArgumentParser) -> None:
+    """Add the shared session-selection arguments to a subcommand parser."""
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("session_id", nargs="?", metavar="SESSION_ID",
+                       help="Session ID (or unique trailing suffix)")
+    group.add_argument("--latest", action="store_true",
+                       help="Use the most recent session")
+
+
+def main(argv: list[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Export an opencode session to Markdown.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--db", metavar="PATH",
+                        help="Path to the opencode SQLite database "
+                             "(default: $XDG_DATA_HOME/opencode/opencode.db)")
+
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # list
+    p_list = sub.add_parser("list", help="List recent sessions")
+    p_list.add_argument("-n", "--limit", type=int, default=20,
+                        help="Number of sessions to show (default: 20)")
+
+    # export
+    p_export = sub.add_parser("export", help="Export a session to Markdown")
+    add_session_args(p_export)
+    p_export.add_argument("-o", "--output", metavar="FILE",
+                          help="Write to FILE instead of stdout")
+
+    # publish
+    p_pub = sub.add_parser(
+        "publish",
+        help="Publish a session as a Gist or GitHub comment",
+        description=textwrap.dedent("""\
+            Publish an opencode session using the GitHub CLI (gh).
+
+            Targets:
+              --gist              Create a new (secret) Gist and print its URL
+              --new-comment REF   Post as a new comment on an issue or PR
+              --edit-comment ID   Append a <details> block to an existing comment
+        """),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    add_session_args(p_pub)
+
+    target = p_pub.add_mutually_exclusive_group(required=True)
+    target.add_argument("--gist", action="store_true",
+                        help="Create a new GitHub Gist (secret by default)")
+    target.add_argument("--new-comment", metavar="ISSUE",
+                        help="Post as a new comment; ISSUE is 'owner/repo#number' or a URL")
+    target.add_argument("--edit-comment", metavar="COMMENT_ID",
+                        help="Append session to an existing comment by its numeric ID")
+
+    p_pub.add_argument("--public", action="store_true",
+                       help="Make the Gist public (only with --gist)")
+    p_pub.add_argument("--repo", metavar="OWNER/REPO",
+                       help="Repository for --edit-comment (auto-detected from cwd if omitted)")
+    p_pub.add_argument("--summary", metavar="TEXT",
+                       help="Custom <details> summary line for --edit-comment "
+                            "(defaults to the session title)")
+
+    args = parser.parse_args(argv)
+
+    if args.command == "list":
+        cmd_list(args)
+    elif args.command == "export":
+        cmd_export(args)
+    elif args.command == "publish":
+        cmd_publish(args)
+
+
+if __name__ == "__main__":
+    main()
